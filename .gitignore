@@ -1,0 +1,20 @@
+# Environment / secrets
+.env
+.garth/
+
+# Database (checked in intentionally — remove this line to track it)
+# garmin.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+venv/
+
+# uv
+.uv/
+
+# macOS
+.DS_Store

@@ -1,0 +1,26 @@
+[project]
+name = "garmin-database"
+version = "0.1.0"
+description = "Build and maintain a local SQLite database of Garmin Connect daily metrics"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "garminconnect>=0.2.8",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+garmin-db = "garmin_db:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["garmin_db.py"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
