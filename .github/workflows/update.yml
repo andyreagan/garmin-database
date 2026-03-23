@@ -1,0 +1,81 @@
+name: Update Garmin DB + Deploy Pages
+
+on:
+  schedule:
+    # Run every morning at 7am UTC (midnight Pacific, 3am Eastern)
+    - cron: '0 7 * * *'
+  workflow_dispatch:   # allow manual trigger from GitHub UI
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Restore cached Garmin tokens
+        # The .garth/ token files are stored as base64-encoded GitHub secrets.
+        # Run `python scripts/export_tokens.py` locally after login to regenerate them.
+        run: |
+          mkdir -p .garth
+          if [ -n "${{ secrets.GARMIN_TOKENS_B64 }}" ]; then
+            echo "${{ secrets.GARMIN_TOKENS_B64 }}" | base64 -d > .garth/oauth1_token.json
+          fi
+          if [ -n "${{ secrets.GARMIN_OAUTH2_B64 }}" ]; then
+            echo "${{ secrets.GARMIN_OAUTH2_B64 }}" | base64 -d > .garth/oauth2_token.json
+          fi
+
+      - name: Pull latest Garmin data
+        env:
+          USERNAME: ${{ secrets.GARMIN_USERNAME }}
+          PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          GARMIN_TOKEN_STORE: .garth
+          DB_PATH: garmin.db
+        run: |
+          uv run python garmin_db.py update --days 7
+
+      - name: Build index.html
+        run: uv run python build_html.py --db garmin.db --out index.html
+
+      - name: Commit updated DB and HTML
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add garmin.db index.html
+          git diff --cached --quiet || git commit -m "chore: update garmin data $(date -u +%Y-%m-%d)"
+          git push
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+
+  deploy:
+    needs: update
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
