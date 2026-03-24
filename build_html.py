@@ -20,8 +20,8 @@ def load_data(db_path: str) -> list[dict]:
         SELECT
             date,
             total_steps,
-            ROUND(total_distance_m / 1000.0, 2)   AS distance_km,
-            ROUND(total_distance_m * 0.000621371, 2) AS distance_mi,
+            ROUND(wellness_distance_m / 1000.0, 2)   AS distance_km,
+            ROUND(wellness_distance_m * 0.000621371, 2) AS distance_mi,
             floors_ascended,
             active_kilocalories,
             bmr_kilocalories,

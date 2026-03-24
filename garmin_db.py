@@ -76,7 +76,8 @@ CREATE TABLE IF NOT EXISTS daily (
     -- steps / activity
     total_steps                 INTEGER,
     step_goal                   INTEGER,
-    total_distance_m            REAL,               -- metres
+    total_distance_m            REAL,               -- metres (includes GPS activities)
+    wellness_distance_m         REAL,               -- metres (step/walking distance only)
     floors_ascended             REAL,
     floors_descended            REAL,
     floors_ascended_goal        INTEGER,
@@ -88,7 +89,8 @@ CREATE TABLE IF NOT EXISTS daily (
     wellness_kilocalories_goal  REAL,
 
     -- heart rate
-    avg_heart_rate              INTEGER,            -- bpm
+    avg_heart_rate              REAL,               -- bpm, computed from HR timeseries
+    min_heart_rate              INTEGER,            -- bpm
     max_heart_rate              INTEGER,
     resting_heart_rate          INTEGER,            -- from user summary
     rhr_value                   INTEGER,            -- from dedicated RHR endpoint (sometimes different)
@@ -322,6 +324,7 @@ def fetch_day(client: Garmin, d: date, verbose: bool = False) -> dict:
         row["total_steps"]                  = _i(_f(summary, "totalSteps"))
         row["step_goal"]                    = _i(_f(summary, "dailyStepGoal"))
         row["total_distance_m"]             = _fl(_f(summary, "totalDistanceMeters"))
+        row["wellness_distance_m"]          = _fl(_f(summary, "wellnessDistanceMeters"))
         row["floors_ascended"]              = _fl(_f(summary, "floorsAscended"))
         row["floors_descended"]             = _fl(_f(summary, "floorsDescended"))
         row["floors_ascended_goal"]         = _i(_f(summary, "floorsAscendedGoal"))
@@ -329,8 +332,8 @@ def fetch_day(client: Garmin, d: date, verbose: bool = False) -> dict:
         row["bmr_kilocalories"]             = _fl(_f(summary, "bmrKilocalories"))
         row["total_kilocalories"]           = _fl(_f(summary, "totalKilocalories"))
         row["wellness_kilocalories_goal"]   = _fl(_f(summary, "wellnessKilocaloriesGoal"))
-        row["avg_heart_rate"]               = _i(_f(summary, "averageHeartRate"))
         row["max_heart_rate"]               = _i(_f(summary, "maxHeartRate"))
+        row["min_heart_rate"]               = _i(_f(summary, "minHeartRate"))
         row["resting_heart_rate"]           = _i(_f(summary, "restingHeartRate"))
         row["avg_stress_level"]             = _i(_f(summary, "averageStressLevel"))
         row["max_stress_level"]             = _i(_f(summary, "maxStressLevel"))
@@ -353,7 +356,15 @@ def fetch_day(client: Garmin, d: date, verbose: bool = False) -> dict:
         # hydration intake is separate endpoint; override placeholder
         row.pop("hydration_intake_ml", None)
 
-    # ---- 2. Sleep ----
+    # ---- 2. Heart rate timeseries (for avg HR — not in summary) ----
+    hr_data = _safe(client.get_heart_rates, ds, label="heart_rates")
+    if hr_data:
+        values = [v[1] for v in (hr_data.get("heartRateValues") or [])
+                  if v and v[1] is not None]
+        if values:
+            row["avg_heart_rate"] = round(sum(values) / len(values), 1)
+
+    # ---- 3. Sleep ----
     sleep = _safe(client.get_sleep_data, ds, label="sleep")
     if sleep:
         sd = _f(sleep, "dailySleepDTO") or {}
@@ -374,7 +385,7 @@ def fetch_day(client: Garmin, d: date, verbose: bool = False) -> dict:
         row["sleep_avg_respiration"]= _fl(_f(sd, "averageRespirationValue"))
         row["sleep_hrv_avg"]        = _fl(_f(sd, "avgOvernightHrv"))
 
-    # ---- 3. Resting heart rate (dedicated endpoint) ----
+    # ---- 4. Resting heart rate (dedicated endpoint) ----
     rhr = _safe(client.get_rhr_day, ds, label="rhr")
     if rhr:
         val = _f(rhr, "allMetrics", "metricsMap", "WELLNESS_RESTING_HEART_RATE")
@@ -384,7 +395,7 @@ def fetch_day(client: Garmin, d: date, verbose: bool = False) -> dict:
                                             "WELLNESS_RESTING_HEART_RATE_7_DAYS_AVG",
                                             0, "value"))
 
-    # ---- 4. HRV ----
+    # ---- 5. HRV ----
     hrv = _safe(client.get_hrv_data, ds, label="hrv")
     if hrv:
         summary_hrv = _f(hrv, "hrvSummary") or {}
@@ -393,20 +404,20 @@ def fetch_day(client: Garmin, d: date, verbose: bool = False) -> dict:
         row["hrv_last_night_5_min_high"]= _fl(_f(summary_hrv, "lastNight5MinHigh"))
         row["hrv_status"]               = _f(summary_hrv, "status")
 
-    # ---- 5. SpO2 ----
+    # ---- 6. SpO2 ----
     spo2 = _safe(client.get_spo2_data, ds, label="spo2")
     if spo2:
         row["spo2_avg"] = _fl(_f(spo2, "averageSpO2"))
         row["spo2_min"] = _fl(_f(spo2, "lowestSpO2"))
 
-    # ---- 6. Respiration ----
+    # ---- 7. Respiration ----
     resp = _safe(client.get_respiration_data, ds, label="respiration")
     if resp:
         row["respiration_avg"] = _fl(_f(resp, "avgWakingRespirationValue"))
         row["respiration_min"] = _fl(_f(resp, "lowestRespirationValue"))
         row["respiration_max"] = _fl(_f(resp, "highestRespirationValue"))
 
-    # ---- 7. Weight / body composition ----
+    # ---- 8. Weight / body composition ----
     weigh = _safe(client.get_daily_weigh_ins, ds, label="weigh_ins")
     if weigh:
         entries = _f(weigh, "dateWeightList") or []
@@ -426,7 +437,7 @@ def fetch_day(client: Garmin, d: date, verbose: bool = False) -> dict:
             if row.get("bone_mass_kg"):
                 row["bone_mass_kg"] = row["bone_mass_kg"] / 1000
 
-    # ---- 8. Hydration ----
+    # ---- 9. Hydration ----
     hydration = _safe(client.get_hydration_data, ds, label="hydration")
     if hydration:
         row["hydration_goal_ml"]   = _fl(_f(hydration, "goalInML"))
