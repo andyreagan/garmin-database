@@ -52,6 +52,7 @@ TOKEN CACHE
 """
 
 import argparse
+import math
 import os
 import sqlite3
 import sys
@@ -156,6 +157,15 @@ CREATE TABLE IF NOT EXISTS daily (
     hydration_goal_ml           REAL,
     hydration_intake_ml         REAL,
 
+    -- derived from the all-day HR timeseries (see hr_timeseries table)
+    hr_zone1_secs               INTEGER,            -- 50-60% of HR max
+    hr_zone2_secs               INTEGER,            -- 60-70%
+    hr_zone3_secs               INTEGER,            -- 70-80%
+    hr_zone4_secs               INTEGER,            -- 80-90%
+    hr_zone5_secs               INTEGER,            -- 90%+
+    trimp                       REAL,               -- Banister TRIMP over the whole day
+    strain                      REAL,               -- 0-21 log-scaled TRIMP (Whoop-like)
+
     -- metadata
     fetched_at                  TEXT                -- ISO-8601 UTC
 );
@@ -164,7 +174,60 @@ CREATE TABLE IF NOT EXISTS meta (
     key     TEXT PRIMARY KEY,
     value   TEXT
 );
+
+-- Raw all-day wellness heart-rate samples (~2-minute resolution)
+CREATE TABLE IF NOT EXISTS hr_timeseries (
+    date    TEXT NOT NULL,      -- YYYY-MM-DD calendar day (joins to daily.date)
+    ts      INTEGER NOT NULL,   -- sample time, unix seconds UTC
+    hr      INTEGER NOT NULL,   -- bpm
+    PRIMARY KEY (date, ts)
+) WITHOUT ROWID;
+
+-- Overnight 5-minute HRV readings
+CREATE TABLE IF NOT EXISTS hrv_readings (
+    date    TEXT NOT NULL,      -- wake-up day (joins to daily.date)
+    ts      TEXT NOT NULL,      -- reading time, ISO UTC
+    hrv_ms  INTEGER NOT NULL,
+    PRIMARY KEY (date, ts)
+) WITHOUT ROWID;
+
+-- Recorded activities (runs, rides, …) — one row per activity
+CREATE TABLE IF NOT EXISTS activities (
+    activity_id      INTEGER PRIMARY KEY,
+    start_time_local TEXT,
+    activity_type    TEXT,               -- e.g. running, cycling, lap_swimming
+    name             TEXT,
+    distance_m       REAL,
+    duration_secs    REAL,
+    avg_hr           INTEGER,
+    max_hr           INTEGER,
+    calories         REAL,
+    elevation_gain_m REAL,
+    fetched_at       TEXT
+);
+
+-- Sleep stage segments (one row per contiguous stage interval)
+CREATE TABLE IF NOT EXISTS sleep_segments (
+    date        TEXT NOT NULL,  -- wake-up day (joins to daily.date)
+    seq         INTEGER NOT NULL,
+    start_time  TEXT,           -- ISO UTC
+    end_time    TEXT,           -- ISO UTC
+    stage       TEXT,           -- deep / light / rem / awake
+    PRIMARY KEY (date, seq)
+) WITHOUT ROWID;
 """
+
+# Columns added after the initial release; open_db() back-fills them onto
+# existing databases with ALTER TABLE.
+DAILY_MIGRATIONS = [
+    ("hr_zone1_secs", "INTEGER"),
+    ("hr_zone2_secs", "INTEGER"),
+    ("hr_zone3_secs", "INTEGER"),
+    ("hr_zone4_secs", "INTEGER"),
+    ("hr_zone5_secs", "INTEGER"),
+    ("trimp", "REAL"),
+    ("strain", "REAL"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +238,10 @@ def open_db(path: str) -> sqlite3.Connection:
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
+    existing = {r[1] for r in con.execute("PRAGMA table_info(daily)").fetchall()}
+    for col, typ in DAILY_MIGRATIONS:
+        if col not in existing:
+            con.execute(f"ALTER TABLE daily ADD COLUMN {col} {typ}")
     con.commit()
     return con
 
@@ -187,6 +254,17 @@ def upsert_day(con: sqlite3.Connection, row: dict) -> None:
     sql = (f"INSERT INTO daily ({col_names}) VALUES ({placeholders}) "
            f"ON CONFLICT(date) DO UPDATE SET {updates}")
     con.execute(sql, list(row.values()))
+
+
+def replace_day_rows(con: sqlite3.Connection, table: str, day: str,
+                     rows: list) -> None:
+    """Idempotently replace all child-table rows for one day."""
+    con.execute(f"DELETE FROM {table} WHERE date=?", (day,))
+    if rows:
+        cols = list(rows[0].keys())
+        sql = (f"INSERT OR REPLACE INTO {table} ({', '.join(cols)}) "
+               f"VALUES ({', '.join('?' * len(cols))})")
+        con.executemany(sql, [[r[c] for c in cols] for r in rows])
 
 
 def set_meta(con: sqlite3.Connection, key: str, value: str) -> None:
@@ -295,19 +373,77 @@ def _fl(v) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
+# Derived HR metrics (time in zone, TRIMP, strain)
+# ---------------------------------------------------------------------------
+
+ZONE_WEIGHTS = (1, 2, 4, 8, 16)   # points per minute in Z1…Z5
+STRAIN_K = 300.0                  # weighted-load scale for the 0-21 mapping
+STAGE_NAMES = {0: "deep", 1: "light", 2: "rem", 3: "awake"}
+
+
+def hr_derived_metrics(samples: list, hr_rest: Optional[int],
+                       hr_max: int) -> dict:
+    """
+    samples: list of (unix_seconds, bpm) sorted by time, covering the whole day.
+
+    Zones are %-of-HR-max bands (Z1 50-60% … Z5 90%+).  TRIMP is Banister's
+    formula on heart-rate reserve, accumulated across the day.  Strain follows
+    the Whoop-patent shape: minutes in each zone earn exponentially increasing
+    points (ZONE_WEIGHTS), and the weighted load saturates onto 0-21 via
+    21·(1 − e^(−load/STRAIN_K)).  All inputs are kept raw in hr_timeseries,
+    so these can be recomputed with different constants.
+    """
+    if not samples or not hr_rest or hr_max <= hr_rest:
+        return {}
+    zones = [0, 0, 0, 0, 0]
+    trimp = 0.0
+    for i, (ts, hr) in enumerate(samples):
+        if i + 1 < len(samples):
+            dt = min(samples[i + 1][0] - ts, 600)   # cap gaps at 10 min
+        else:
+            dt = 120                                # typical sample spacing
+        if dt <= 0:
+            continue
+        pct = hr / hr_max
+        if   pct >= 0.9: zones[4] += dt
+        elif pct >= 0.8: zones[3] += dt
+        elif pct >= 0.7: zones[2] += dt
+        elif pct >= 0.6: zones[1] += dt
+        elif pct >= 0.5: zones[0] += dt
+        hrr = (hr - hr_rest) / (hr_max - hr_rest)
+        if hrr > 0:
+            trimp += (dt / 60) * hrr * 0.64 * math.exp(1.92 * hrr)
+    load = sum(w * secs / 60 for w, secs in zip(ZONE_WEIGHTS, zones))
+    return {
+        "hr_zone1_secs": zones[0],
+        "hr_zone2_secs": zones[1],
+        "hr_zone3_secs": zones[2],
+        "hr_zone4_secs": zones[3],
+        "hr_zone5_secs": zones[4],
+        "trimp": round(trimp, 1),
+        "strain": round(21 * (1 - math.exp(-load / STRAIN_K)), 1),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Per-day fetch
 # ---------------------------------------------------------------------------
 
-def fetch_day(client: Garmin, d: date, verbose: bool = False) -> dict:
+def fetch_day(client: Garmin, d: date, verbose: bool = False) -> tuple:
     """
-    Fetch all available metrics for a single calendar day and return a
-    dict ready to upsert into the `daily` table.
+    Fetch all available metrics for a single calendar day.
+
+    Returns (row, children): `row` upserts into `daily`; `children` maps
+    child-table name → list of row dicts.  A child table only appears in
+    `children` when its endpoint responded, so failed fetches never wipe
+    previously stored rows.
     """
     ds = d.isoformat()          # "YYYY-MM-DD"
     row: dict[str, Any] = {
         "date": ds,
         "fetched_at": now_utc(),
     }
+    children: dict[str, list] = {}
 
     def _safe(fn, *args, label=""):
         """Call fn(*args), return result or None on any error."""
@@ -356,12 +492,18 @@ def fetch_day(client: Garmin, d: date, verbose: bool = False) -> dict:
         # hydration intake is separate endpoint; override placeholder
         row.pop("hydration_intake_ml", None)
 
-    # ---- 2. Heart rate timeseries (for avg HR — not in summary) ----
+    # ---- 2. Heart rate timeseries (stored raw; also avg HR + zones/strain) ----
     hr_data = _safe(client.get_heart_rates, ds, label="heart_rates")
+    hr_samples: list[tuple[int, int]] = []
     if hr_data:
-        values = [v[1] for v in (hr_data.get("heartRateValues") or [])
-                  if v and v[1] is not None]
-        if values:
+        for v in (hr_data.get("heartRateValues") or []):
+            if v and v[0] is not None and v[1] is not None:
+                hr_samples.append((int(v[0] / 1000), int(v[1])))
+        hr_samples.sort()
+        children["hr_timeseries"] = [
+            {"date": ds, "ts": t, "hr": h} for t, h in hr_samples]
+        if hr_samples:
+            values = [h for _, h in hr_samples]
             row["avg_heart_rate"] = round(sum(values) / len(values), 1)
 
     # ---- 3. Sleep ----
@@ -370,20 +512,37 @@ def fetch_day(client: Garmin, d: date, verbose: bool = False) -> dict:
         sd = _f(sleep, "dailySleepDTO") or {}
         row["sleep_start"]          = _f(sd, "sleepStartTimestampLocal")  # epoch ms → str later
         row["sleep_end"]            = _f(sd, "sleepEndTimestampLocal")
-        # convert epoch-ms to ISO strings if present
+        # Garmin's *Local timestamps are epochs already shifted into local
+        # wall-clock time, so read them as UTC — fromtimestamp() without tz
+        # would apply the machine's UTC offset a second time.
         for k in ("sleep_start", "sleep_end"):
             v = row.get(k)
             if isinstance(v, (int, float)) and v:
-                row[k] = datetime.fromtimestamp(v / 1000).isoformat()
+                row[k] = (datetime.fromtimestamp(v / 1000, tz=timezone.utc)
+                          .replace(tzinfo=None).isoformat())
         row["sleep_total_seconds"]  = _i(_f(sd, "sleepTimeSeconds"))
         row["sleep_deep_seconds"]   = _i(_f(sd, "deepSleepSeconds"))
         row["sleep_light_seconds"]  = _i(_f(sd, "lightSleepSeconds"))
         row["sleep_rem_seconds"]    = _i(_f(sd, "remSleepSeconds"))
         row["sleep_awake_seconds"]  = _i(_f(sd, "awakeSleepSeconds"))
         row["sleep_score"]          = _fl(_f(sd, "sleepScores", "overall", "value"))
-        row["sleep_avg_spo2"]       = _fl(_f(sd, "averageSpO2Value"))
-        row["sleep_avg_respiration"]= _fl(_f(sd, "averageRespirationValue"))
-        row["sleep_hrv_avg"]        = _fl(_f(sd, "avgOvernightHrv"))
+        # These keys have moved between dailySleepDTO and the payload root
+        # across API versions — try both.
+        row["sleep_avg_spo2"]       = (_fl(_f(sd, "averageSpO2Value"))
+                                       or _fl(_f(sleep, "wellnessSpO2SleepSummaryDTO", "averageSPO2"))
+                                       or _fl(_f(sleep, "wellnessSpO2SleepSummaryDTO", "averageSpO2")))
+        row["sleep_avg_respiration"]= (_fl(_f(sd, "averageRespirationValue"))
+                                       or _fl(_f(sleep, "avgSleepRespirationValue")))
+        row["sleep_hrv_avg"]        = (_fl(_f(sd, "avgOvernightHrv"))
+                                       or _fl(_f(sleep, "avgOvernightHrv")))
+        segments = _f(sleep, "sleepLevels") or []
+        children["sleep_segments"] = [
+            {"date": ds, "seq": i,
+             "start_time": _f(seg, "startGMT"),
+             "end_time": _f(seg, "endGMT"),
+             "stage": STAGE_NAMES.get(_i(_f(seg, "activityLevel")),
+                                      str(_f(seg, "activityLevel")))}
+            for i, seg in enumerate(segments)]
 
     # ---- 4. Resting heart rate (dedicated endpoint) ----
     rhr = _safe(client.get_rhr_day, ds, label="rhr")
@@ -400,9 +559,14 @@ def fetch_day(client: Garmin, d: date, verbose: bool = False) -> dict:
     if hrv:
         summary_hrv = _f(hrv, "hrvSummary") or {}
         row["hrv_weekly_avg"]           = _fl(_f(summary_hrv, "weeklyAvg"))
-        row["hrv_last_night_avg"]       = _fl(_f(summary_hrv, "lastNight"))
+        row["hrv_last_night_avg"]       = _fl(_f(summary_hrv, "lastNightAvg"))
         row["hrv_last_night_5_min_high"]= _fl(_f(summary_hrv, "lastNight5MinHigh"))
         row["hrv_status"]               = _f(summary_hrv, "status")
+        children["hrv_readings"] = [
+            {"date": ds, "ts": _f(r, "readingTimeGMT"),
+             "hrv_ms": _i(_f(r, "hrvValue"))}
+            for r in (_f(hrv, "hrvReadings") or [])
+            if _f(r, "readingTimeGMT") and _i(_f(r, "hrvValue")) is not None]
 
     # ---- 6. SpO2 ----
     spo2 = _safe(client.get_spo2_data, ds, label="spo2")
@@ -443,7 +607,13 @@ def fetch_day(client: Garmin, d: date, verbose: bool = False) -> dict:
         row["hydration_goal_ml"]   = _fl(_f(hydration, "goalInML"))
         row["hydration_intake_ml"] = _fl(_f(hydration, "totalIntakeInML"))
 
-    return row
+    # ---- 10. Derived zone / TRIMP / strain from the HR series ----
+    if hr_samples:
+        hr_rest = row.get("resting_heart_rate") or row.get("rhr_value")
+        hr_max = int(os.environ.get("GARMIN_HR_MAX", "202"))
+        row.update(hr_derived_metrics(hr_samples, hr_rest, hr_max))
+
+    return row, children
 
 
 # ---------------------------------------------------------------------------
@@ -465,8 +635,10 @@ def pull_range(client: Garmin, con: sqlite3.Connection,
         label = f"[{i}/{total}] {d}"
         print(label, end="  ", flush=True)
         try:
-            row = fetch_day(client, d, verbose=verbose)
+            row, children = fetch_day(client, d, verbose=verbose)
             upsert_day(con, row)
+            for table, rows in children.items():
+                replace_day_rows(con, table, row["date"], rows)
             count += 1
             # Summarise what we got
             summary_bits = []
@@ -479,6 +651,11 @@ def pull_range(client: Garmin, con: sqlite3.Connection,
             if row.get("sleep_total_seconds") is not None:
                 hrs = row["sleep_total_seconds"] / 3600
                 summary_bits.append(f"sleep={hrs:.1f}h")
+            if row.get("strain") is not None:
+                summary_bits.append(f"strain={row['strain']}")
+            n_hr = len(children.get("hr_timeseries") or [])
+            if n_hr:
+                summary_bits.append(f"hr×{n_hr}")
             print("  ".join(summary_bits) or "(no data)", flush=True)
         except Exception as exc:
             print(f"ERROR: {exc}", flush=True)
@@ -526,12 +703,13 @@ def do_login(token_store: str, username: str, password: str) -> None:
 
 
 def do_build(client: Garmin, con: sqlite3.Connection,
-             start_date: str, verbose: bool = False) -> None:
+             start_date: str, verbose: bool = False,
+             delay: float = 0.5) -> None:
     start = date.fromisoformat(start_date)
     end   = date.today()
     print(f"Pulling full history from {start} → {end} …", flush=True)
     print("(This will take a while; each day makes ~8 API calls.)\n", flush=True)
-    n = pull_range(client, con, start, end, verbose=verbose)
+    n = pull_range(client, con, start, end, delay=delay, verbose=verbose)
     set_meta(con, "last_full_build", now_utc())
     set_meta(con, "build_start_date", start_date)
     con.commit()
@@ -539,7 +717,8 @@ def do_build(client: Garmin, con: sqlite3.Connection,
 
 
 def do_update(client: Garmin, con: sqlite3.Connection,
-              lookback_days: int = 7, verbose: bool = False) -> None:
+              lookback_days: int = 7, verbose: bool = False,
+              delay: float = 0.5) -> None:
     """
     Re-pull the last `lookback_days` days (to catch edits), then pull
     any days newer than the most-recent row in the DB.
@@ -550,11 +729,95 @@ def do_update(client: Garmin, con: sqlite3.Connection,
     window_start = today - timedelta(days=lookback_days - 1)
     print(f"Re-pulling last {lookback_days} days ({window_start} → {today}) …",
           flush=True)
-    pull_range(client, con, window_start, today, verbose=verbose)
+    pull_range(client, con, window_start, today, delay=delay, verbose=verbose)
 
     set_meta(con, "last_update", now_utc())
     con.commit()
     print(f"\nUpdate complete.")
+
+
+def do_activities(client: Garmin, con: sqlite3.Connection,
+                  delay: float = 1.0) -> None:
+    """
+    Pull the full activity list (newest first, 100 per page) and upsert into
+    the activities table.  Idempotent; re-running refreshes everything.
+    """
+    page_size = 100
+    start = 0
+    total = 0
+    while True:
+        batch = client.get_activities(start, page_size)
+        if not batch:
+            break
+        for a in batch:
+            con.execute(
+                """INSERT INTO activities
+                   (activity_id, start_time_local, activity_type, name,
+                    distance_m, duration_secs, avg_hr, max_hr, calories,
+                    elevation_gain_m, fetched_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(activity_id) DO UPDATE SET
+                     start_time_local=excluded.start_time_local,
+                     activity_type=excluded.activity_type,
+                     name=excluded.name,
+                     distance_m=excluded.distance_m,
+                     duration_secs=excluded.duration_secs,
+                     avg_hr=excluded.avg_hr,
+                     max_hr=excluded.max_hr,
+                     calories=excluded.calories,
+                     elevation_gain_m=excluded.elevation_gain_m,
+                     fetched_at=excluded.fetched_at""",
+                (_i(_f(a, "activityId")),
+                 _f(a, "startTimeLocal"),
+                 _f(a, "activityType", "typeKey"),
+                 _f(a, "activityName"),
+                 _fl(_f(a, "distance")),
+                 _fl(_f(a, "duration")),
+                 _i(_f(a, "averageHR")),
+                 _i(_f(a, "maxHR")),
+                 _fl(_f(a, "calories")),
+                 _fl(_f(a, "elevationGain")),
+                 now_utc()))
+        total += len(batch)
+        con.commit()
+        print(f"  fetched {total} activities "
+              f"(oldest so far: {_f(batch[-1], 'startTimeLocal')})", flush=True)
+        if len(batch) < page_size:
+            break
+        start += page_size
+        time.sleep(delay)
+    print(f"Done. {total} activities stored.")
+
+
+def do_recompute(con: sqlite3.Connection) -> None:
+    """
+    Recompute zone / TRIMP / strain columns for every day that has raw
+    hr_timeseries rows.  Pure local computation — no API calls.  Useful after
+    changing ZONE_WEIGHTS / STRAIN_K / GARMIN_HR_MAX.
+    """
+    hr_max = int(os.environ.get("GARMIN_HR_MAX", "202"))
+    days = [r[0] for r in con.execute(
+        "SELECT DISTINCT date FROM hr_timeseries ORDER BY date").fetchall()]
+    print(f"Recomputing derived HR metrics for {len(days)} days "
+          f"(HR max = {hr_max}) …", flush=True)
+    n = 0
+    for day in days:
+        samples = [(r[0], r[1]) for r in con.execute(
+            "SELECT ts, hr FROM hr_timeseries WHERE date=? ORDER BY ts",
+            (day,)).fetchall()]
+        rest = con.execute(
+            "SELECT COALESCE(resting_heart_rate, rhr_value) FROM daily "
+            "WHERE date=?", (day,)).fetchone()
+        metrics = hr_derived_metrics(samples, rest[0] if rest else None, hr_max)
+        if metrics:
+            sets = ", ".join(f"{k}=?" for k in metrics)
+            con.execute(f"UPDATE daily SET {sets} WHERE date=?",
+                        list(metrics.values()) + [day])
+            n += 1
+        if n % 500 == 0:
+            con.commit()
+    con.commit()
+    print(f"Done. {n} days recomputed.")
 
 
 def do_stats(db_path: str) -> None:
@@ -675,7 +938,8 @@ def main() -> None:
     )
     parser.add_argument(
         "mode",
-        choices=["login", "build", "update", "stats"],
+        choices=["login", "build", "update", "stats", "recompute",
+                 "activities"],
         help="Operation to perform",
     )
     parser.add_argument("--db", default=None, help="Override DB_PATH from .env")
@@ -683,6 +947,9 @@ def main() -> None:
                         help="(update) Days to re-pull for edits (default: 7)")
     parser.add_argument("--start", default=None,
                         help="(build) Override GARMIN_START_DATE, e.g. 2015-01-01")
+    parser.add_argument("--delay", type=float, default=0.5,
+                        help="Seconds to sleep between days (default: 0.5; "
+                             "raise it to be gentler on the API)")
     parser.add_argument("--env", default=".env",
                         help="Path to .env file (default: .env)")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -705,9 +972,13 @@ def main() -> None:
         do_login(token_store, username, password)
         return
 
-    # ---- stats (no client needed) ----
+    # ---- stats / recompute (no client needed) ----
     if args.mode == "stats":
         do_stats(db_path)
+        return
+
+    if args.mode == "recompute":
+        do_recompute(open_db(db_path))
         return
 
     # ---- build / update need a client ----
@@ -716,11 +987,16 @@ def main() -> None:
     client = make_client(token_store, username, password)
     con    = open_db(db_path)
 
-    if args.mode == "build":
-        do_build(client, con, start_date, verbose=args.verbose)
+    if args.mode == "activities":
+        do_activities(client, con, delay=max(args.delay, 1.0))
+
+    elif args.mode == "build":
+        do_build(client, con, start_date, verbose=args.verbose,
+                 delay=args.delay)
 
     elif args.mode == "update":
-        do_update(client, con, lookback_days=args.days, verbose=args.verbose)
+        do_update(client, con, lookback_days=args.days, verbose=args.verbose,
+                  delay=args.delay)
 
 
 if __name__ == "__main__":

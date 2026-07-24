@@ -19,6 +19,22 @@ keep the database up to date.
 | **Weight / body comp** | weight (kg), BMI, body fat %, body water %, muscle mass (kg), bone mass (kg) |
 | **Intensity minutes** | moderate mins, vigorous mins, daily goal |
 | **Hydration** | goal (ml), total intake (ml) |
+| **Derived (from HR series)** | seconds in HR zones 1–5 (% of HR max bands), Banister TRIMP, Whoop-like strain (0–21: zone minutes earn exponentially weighted points 1/2/4/8/16, then saturate via 21·(1−e^(−load/300)); rerun `recompute` after tuning constants) |
+
+## Raw timeseries tables
+
+Alongside the one-row-per-day `daily` table, three child tables keep the raw
+intraday data (all keyed by `date` so they join back to `daily`):
+
+| Table | Contents |
+|---|---|
+| `hr_timeseries` | all-day wellness heart rate, ~2-min samples (`ts` unix seconds UTC, `hr` bpm) |
+| `hrv_readings` | overnight 5-min HRV readings (`ts` ISO UTC, `hrv_ms`) |
+| `sleep_segments` | sleep stage intervals (`seq`, `start_time`/`end_time` ISO UTC, `stage` deep/light/rem/awake) |
+
+Zone boundaries and strain use `GARMIN_HR_MAX` from `.env` (default 202) and
+the day's resting HR; since the raw series is stored, they can be recomputed
+with different constants at any time.
 
 ## Setup
 
@@ -56,6 +72,9 @@ python garmin_db.py stats
 
 # Verbose mode (shows per-endpoint errors, useful for debugging)
 python garmin_db.py build --verbose
+
+# Be gentle on the API (seconds of sleep between days, default 0.5)
+python garmin_db.py build --delay 2.0
 ```
 
 ## How it works
