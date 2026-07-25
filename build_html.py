@@ -8,8 +8,11 @@ Usage:
 """
 
 import argparse
+import calendar
 import json
 import sqlite3
+from collections import defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -57,6 +60,207 @@ def load_data(db_path: str) -> list[dict]:
         ORDER BY date ASC
     """).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Long-term trend computation (all run at build time, in Python)
+# ---------------------------------------------------------------------------
+
+RUN_TYPES = ("running", "trail_running", "treadmill_running", "track_running",
+             "indoor_running", "street_running")
+BIKE_TYPES = ("cycling", "road_biking", "mountain_biking", "gravel_cycling",
+              "cyclocross", "indoor_cycling", "virtual_ride", "track_cycling",
+              "bmx", "recumbent_cycling", "e_bike_fitness", "e_bike_mountain")
+# Whoop-style consistency: agreement vs each of the previous 4 days, recent
+# days weighted more.
+CONS_WEIGHTS = [0.4, 0.3, 0.2, 0.1]
+
+
+def _month_range(m_lo, m_hi):
+    y, m = map(int, m_lo.split("-"))
+    ey, em = map(int, m_hi.split("-"))
+    out = []
+    while (y, m) <= (ey, em):
+        out.append(f"{y:04d}-{m:02d}")
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+    return out
+
+
+def _month_avg(days, key, min_n=5):
+    """{month: (mean, n)} over days where key is present; months with < min_n kept but flagged via n."""
+    buckets = defaultdict(list)
+    for d in days:
+        v = d.get(key)
+        if v is not None:
+            buckets[d["date"][:7]].append(float(v))
+    return {m: (sum(v) / len(v), len(v)) for m, v in buckets.items()}
+
+
+def _rolling(months, vc, weighted=True, min_pts=3):
+    """Trailing 12-month rolling mean of {month:(val,n)}; weighted by n when asked."""
+    out = []
+    for i in range(len(months)):
+        num = den = 0.0
+        pts = 0
+        for j in range(max(0, i - 11), i + 1):
+            hit = vc.get(months[j])
+            if hit and hit[0] is not None:
+                w = hit[1] if weighted else 1
+                num += hit[0] * w
+                den += w
+                pts += 1
+        out.append(round(num / den, 3) if den and pts >= min_pts else None)
+    return out
+
+
+def _series(months, vc, min_n=1):
+    """Return the monthly point list (None where n < min_n), aligned to months."""
+    return [vc[m][0] if (m in vc and vc[m][1] >= min_n) else None for m in months]
+
+
+def load_activities_monthly(con):
+    run = defaultdict(float)
+    bike = defaultdict(float)
+    try:
+        rows = con.execute(
+            "SELECT substr(start_time_local,1,7) m, activity_type t, "
+            "COALESCE(distance_m,0) d FROM activities").fetchall()
+    except sqlite3.OperationalError:
+        return {}, {}                       # activities table not present
+    for m, t, d in rows:
+        if not m:
+            continue
+        mi = d / 1609.344
+        if t in RUN_TYPES:
+            run[m] += mi
+        elif t in BIKE_TYPES:
+            bike[m] += mi
+    return run, bike
+
+
+def _weekly_rate(total_by_month):
+    """Convert {month: total_miles} to {month: (miles_per_week, 1)}."""
+    out = {}
+    for m, tot in total_by_month.items():
+        y, mo = map(int, m.split("-"))
+        weeks = calendar.monthrange(y, mo)[1] / 7.0
+        out[m] = (tot / weeks, 1)
+    return out
+
+
+def _parse_dt(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "").replace(".0", ""))
+    except ValueError:
+        return None
+
+
+def compute_regularity(con):
+    """Monthly SRI (consecutive-day) and Whoop-style 4-day consistency.
+
+    Uses sleep-stage segments where available (awake episodes count as awake);
+    older nights fall back to the solid main sleep window. Returns two
+    {month: (value, n_pairs)} dicts.
+    """
+    minutes = defaultdict(lambda: bytearray(1440))   # 1 = asleep, per clock minute
+    tracked = set()
+    seg_dates = set()
+
+    def mark(start, end):
+        t = start.replace(second=0, microsecond=0)
+        while t < end:
+            minutes[t.date().isoformat()][t.hour * 60 + t.minute] = 1
+            t += timedelta(minutes=1)
+
+    for ds, s, e, stage in con.execute(
+            "SELECT date,start_time,end_time,stage FROM sleep_segments "
+            "WHERE start_time IS NOT NULL AND end_time IS NOT NULL"):
+        seg_dates.add(ds)
+        if stage == "awake":
+            continue
+        st, en = _parse_dt(s), _parse_dt(e)
+        if not st or not en or en <= st:
+            continue
+        tracked.add(ds)
+        mark(st, en)
+
+    for ds, s, e in con.execute(
+            "SELECT date,sleep_start,sleep_end FROM daily "
+            "WHERE sleep_start IS NOT NULL AND sleep_end IS NOT NULL "
+            "AND sleep_total_seconds > 0"):
+        if ds in seg_dates:
+            continue
+        st, en = _parse_dt(s), _parse_dt(e)
+        if not st or not en or en <= st or (en - st) > timedelta(hours=20):
+            continue
+        tracked.add(ds)
+        mark(st, en)
+
+    def agreement(a, b):
+        return sum(1 for i in range(1440) if a[i] == b[i]) / 1440
+
+    sri = defaultdict(list)
+    cons = defaultdict(list)
+    for ds in sorted(tracked):
+        d = datetime.fromisoformat(ds).date()
+        lags = []
+        for k in range(1, 5):
+            prev = (d - timedelta(days=k)).isoformat()
+            if prev in tracked:
+                lags.append((k, -100 + 200 * agreement(minutes[ds], minutes[prev])))
+        if lags and lags[0][0] == 1:
+            sri[ds[:7]].append(lags[0][1])
+        if len(lags) >= 3:
+            wsum = sum(CONS_WEIGHTS[k - 1] for k, _ in lags)
+            cons[ds[:7]].append(
+                sum(CONS_WEIGHTS[k - 1] * v for k, v in lags) / wsum)
+
+    sri_m = {m: (sum(v) / len(v), len(v)) for m, v in sri.items()}
+    cons_m = {m: (sum(v) / len(v), len(v)) for m, v in cons.items()}
+    return sri_m, cons_m
+
+
+def build_trends(con, days):
+    steps_m = _month_avg(days, "total_steps")
+    sleep_m = _month_avg(days, "sleep_total_h")
+    hrv_m = _month_avg(days, "hrv_last_night_avg")
+    run_tot, bike_tot = load_activities_monthly(con)
+    runwk_m = _weekly_rate(run_tot)
+    bikewk_m = _weekly_rate(bike_tot)
+    sri_m, cons_m = compute_regularity(con)
+
+    allm = (set(steps_m) | set(sleep_m) | set(hrv_m) | set(runwk_m)
+            | set(bikewk_m) | set(sri_m) | set(cons_m))
+    if not allm:
+        return {"months": []}
+    months = _month_range(min(allm), max(allm))
+
+    sleep_roll = _rolling(months, sleep_m)
+    cons_roll = _rolling(months, cons_m, weighted=True)
+    phase = [{"m": months[i], "x": sleep_roll[i], "y": cons_roll[i]}
+             for i in range(len(months))
+             if sleep_roll[i] is not None and cons_roll[i] is not None]
+
+    return {
+        "months": months,
+        "steps": _series(months, steps_m),
+        "steps_roll": _rolling(months, steps_m),
+        "run_roll": _rolling(months, runwk_m, weighted=False),
+        "bike_roll": _rolling(months, bikewk_m, weighted=False),
+        "sleep": _series(months, sleep_m),
+        "sleep_roll": sleep_roll,
+        "hrv": _series(months, hrv_m),
+        "hrv_roll": _rolling(months, hrv_m),
+        "sri": _series(months, sri_m, min_n=5),
+        "sri_roll": _rolling(months, sri_m),
+        "cons_roll": cons_roll,
+        "phase": phase,
+    }
 
 
 HTML_TEMPLATE = """\
@@ -190,6 +394,7 @@ HTML_TEMPLATE = """\
     .filter-row {{ flex-direction: column; }}
     select, input {{ min-width: 100%; }}
   }}
+{trends_css}
 </style>
 </head>
 <body>
@@ -236,7 +441,8 @@ HTML_TEMPLATE = """\
 
   <!-- TABS -->
   <div class="tabs">
-    <div class="tab active" data-tab="steps">Steps</div>
+    <div class="tab active" data-tab="trends">Long-term Trends</div>
+    <div class="tab" data-tab="steps">Steps</div>
     <div class="tab" data-tab="heart">Heart Rate</div>
     <div class="tab" data-tab="sleep">Sleep</div>
     <div class="tab" data-tab="body">Body</div>
@@ -244,8 +450,10 @@ HTML_TEMPLATE = """\
     <div class="tab" data-tab="daily">Daily Log</div>
   </div>
 
+{trends_panel}
+
   <!-- STEPS TAB -->
-  <div class="panel active" id="panel-steps">
+  <div class="panel" id="panel-steps">
     <div class="chart-wrap">
       <h3>Weekly steps — last 52 weeks</h3>
       <div class="bar-chart" id="steps-chart"></div>
@@ -389,6 +597,7 @@ HTML_TEMPLATE = """\
 <script>
 // ── DATA ──────────────────────────────────────────────────────────────────
 {data_js}
+{trends_js}
 
 // ── HELPERS ───────────────────────────────────────────────────────────────
 const fmt1   = v => v == null ? '—' : (+v).toFixed(1);
@@ -738,22 +947,415 @@ document.querySelectorAll('.tab').forEach(tab => {{
 
 // ── BOOT ──────────────────────────────────────────────────────────────────
 render();
+{trends_script}
 </script>
 </body>
 </html>
 """
 
 
+TRENDS_CSS = """\
+  /* ── long-term trends ── */
+  .trend-card { background: var(--surface); border: 1px solid var(--border);
+                border-radius: var(--radius); padding: 16px; margin-bottom: 20px; }
+  .trend-card h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: .06em;
+                   color: var(--muted); margin-bottom: 4px; }
+  .trend-card p.tdesc { color: var(--muted); font-size: 0.78rem; margin-bottom: 10px; max-width: 78ch; }
+  .trend-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 8px;
+                  font-size: 0.75rem; color: var(--muted); }
+  .trend-legend .k { display: inline-flex; align-items: center; gap: 6px; }
+  .trend-legend .sw { width: 16px; height: 0; border-top: 2.5px solid; border-radius: 2px; }
+  .trend-box { position: relative; }
+  .trend-box svg { display: block; width: 100%; height: auto; }
+  .trend-box:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+  .trend-tip { position: absolute; pointer-events: none; display: none; z-index: 5;
+               background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+               padding: 7px 10px; font-size: 0.75rem; min-width: 150px;
+               box-shadow: 0 4px 14px rgba(0,0,0,.45); }
+  .trend-tip .tm { color: var(--muted); font-weight: 600; margin-bottom: 3px; }
+  .trend-tip .tr { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+  .trend-tip .tk { width: 11px; height: 0; border-top: 2.5px solid; border-radius: 2px; flex: none; }
+  .trend-tip .tv { font-variant-numeric: tabular-nums; font-weight: 700; }
+  .trend-tip .tl { color: var(--muted); }
+  .phase-controls { display: flex; align-items: center; gap: 12px; margin: 6px 0 8px; }
+  .phase-controls button { background: var(--accent); color: #fff; border: none;
+                           border-radius: 6px; padding: 5px 14px; cursor: pointer;
+                           font-size: 0.8rem; font-weight: 600; }
+  .phase-controls button:hover { background: var(--accent2); }
+  .phase-controls input[type=range] { flex: 1; accent-color: var(--accent); }
+  .phase-controls .when { min-width: 74px; text-align: right; color: var(--muted);
+                          font-variant-numeric: tabular-nums; font-size: 0.8rem; }
+"""
+
+TRENDS_PANEL = """\
+  <!-- LONG-TERM TRENDS TAB -->
+  <div class="panel active" id="panel-trends">
+    <div class="trend-card">
+      <h3>Daily steps, averaged by month</h3>
+      <p class="tdesc">Faint line is each month's average; solid line is the 12-month rolling average.</p>
+      <div class="trend-legend">
+        <span class="k"><span class="sw" style="border-color:#4b5066"></span>Monthly avg</span>
+        <span class="k"><span class="sw" style="border-color:#00b4d8"></span>12-month rolling</span>
+      </div>
+      <div class="trend-box" id="t-steps" tabindex="0" role="img" aria-label="Monthly average daily steps over time"></div>
+    </div>
+
+    <div class="trend-card">
+      <h3>Miles run and biked per week</h3>
+      <p class="tdesc">12-month rolling average of weekly miles; hover for any month's actual pace. Cycling overtook running in 2025.</p>
+      <div class="trend-legend">
+        <span class="k"><span class="sw" style="border-color:#f4a261"></span>Running</span>
+        <span class="k"><span class="sw" style="border-color:#2ec4b6"></span>Cycling</span>
+      </div>
+      <div class="trend-box" id="t-miles" tabindex="0" role="img" aria-label="Monthly miles run and biked per week"></div>
+    </div>
+
+    <div class="trend-card">
+      <h3>Sleep duration, averaged by month</h3>
+      <p class="tdesc">Monthly mean nightly sleep, with the 12-month rolling trend.</p>
+      <div class="trend-legend">
+        <span class="k"><span class="sw" style="border-color:#4b5066"></span>Monthly avg</span>
+        <span class="k"><span class="sw" style="border-color:#b892ff"></span>12-month rolling</span>
+      </div>
+      <div class="trend-box" id="t-sleep" tabindex="0" role="img" aria-label="Monthly average sleep duration over time"></div>
+    </div>
+
+    <div class="trend-card">
+      <h3>Overnight HRV, averaged by month</h3>
+      <p class="tdesc">Garmin's morning-report HRV (last-night average, ms). Recorded since mid-2022.</p>
+      <div class="trend-legend">
+        <span class="k"><span class="sw" style="border-color:#4b5066"></span>Monthly avg</span>
+        <span class="k"><span class="sw" style="border-color:#ffd166"></span>12-month rolling</span>
+      </div>
+      <div class="trend-box" id="t-hrv" tabindex="0" role="img" aria-label="Monthly average overnight HRV over time"></div>
+    </div>
+
+    <div class="trend-card">
+      <h3>Sleep regularity</h3>
+      <p class="tdesc">SRI: minute-by-minute sleep/wake agreement between consecutive days (100 = identical schedule).
+      Consistency: the same agreement against a weighted window of the previous four days (Whoop-style) — a stricter read.</p>
+      <div class="trend-legend">
+        <span class="k"><span class="sw" style="border-color:#4b5066"></span>SRI monthly</span>
+        <span class="k"><span class="sw" style="border-color:#43aa8b"></span>SRI 12-mo</span>
+        <span class="k"><span class="sw" style="border-color:#e76f9e"></span>Consistency (4-day) 12-mo</span>
+      </div>
+      <div class="trend-box" id="t-sri" tabindex="0" role="img" aria-label="Monthly sleep regularity index and 4-day consistency over time"></div>
+    </div>
+
+    <div class="trend-card">
+      <h3>Sleep duration × regularity, walked through time</h3>
+      <p class="tdesc">Each point is a month (12-month rolling sleep duration against 4-day consistency);
+      the line connects them in order, earlier → later. Press play to watch the path unfold, or drag the slider.</p>
+      <div class="phase-controls">
+        <button id="phase-play" type="button">▶ Play</button>
+        <input type="range" id="phase-scrub" min="0" max="1" step="0.001" value="0" aria-label="Scrub through time">
+        <span class="when" id="phase-when"></span>
+      </div>
+      <div class="trend-box" id="t-phase" tabindex="0" role="img" aria-label="Connected scatterplot of sleep duration against 4-day consistency, traced chronologically"></div>
+    </div>
+  </div>
+"""
+
+TRENDS_SCRIPT = r"""
+// ── LONG-TERM TRENDS ──────────────────────────────────────────────────────
+(function () {
+  const T = TRENDS;
+  if (!T.months || !T.months.length) return;
+  const NS = 'http://www.w3.org/2000/svg';
+  const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const el = (p, name, attrs) => {
+    const e = document.createElementNS(NS, name);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    p.appendChild(e);
+    return e;
+  };
+  const monthLabel = m => { const [y, mo] = m.split('-'); return MONTH_NAMES[+mo - 1] + ' ' + y; };
+  const W = 900, H = 260, M = { t: 12, r: 66, b: 24, l: 46 };
+  const iw = W - M.l - M.r, ih = H - M.t - M.b;
+
+  function lineChart(boxId, cfg) {
+    const box = document.getElementById(boxId);
+    if (!box) return;
+    const months = T.months, n = months.length;
+    const x = i => M.l + (n === 1 ? 0 : i / (n - 1) * iw);
+    const y = v => M.t + ih - (v - cfg.yMin) / (cfg.yMax - cfg.yMin) * ih;
+    const svg = el(box, 'svg', { viewBox: `0 0 ${W} ${H}` });
+
+    for (const tv of cfg.ticks) {
+      el(svg, 'line', { x1: M.l, x2: M.l + iw, y1: y(tv), y2: y(tv), stroke: 'var(--border)', 'stroke-width': 1 });
+      const t = el(svg, 'text', { x: M.l - 7, y: y(tv) + 4, 'text-anchor': 'end', 'font-size': 10, fill: 'var(--muted)' });
+      t.textContent = cfg.tickFmt(tv);
+    }
+    months.forEach((m, i) => {
+      const [yy, mo] = m.split('-');
+      if (mo === '01' && +yy % 2 === 0) {
+        const t = el(svg, 'text', { x: x(i), y: M.t + ih + 16, 'text-anchor': 'middle', 'font-size': 10, fill: 'var(--muted)' });
+        t.textContent = yy;
+      }
+    });
+    el(svg, 'line', { x1: M.l, x2: M.l + iw, y1: M.t + ih, y2: M.t + ih, stroke: 'var(--border)', 'stroke-width': 1 });
+
+    const pathOf = vals => {
+      let s = '', pen = false;
+      vals.forEach((v, i) => {
+        if (v == null) { pen = false; return; }
+        s += (pen ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(v).toFixed(1);
+        pen = true;
+      });
+      return s;
+    };
+    cfg.series.forEach(se => {
+      el(svg, 'path', { d: pathOf(se.vals), fill: 'none', stroke: se.color,
+        'stroke-width': se.width || 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+        opacity: se.faint ? 0.55 : 1 });
+    });
+    cfg.series.filter(se => se.label).forEach(se => {
+      let last = -1;
+      se.vals.forEach((v, i) => { if (v != null) last = i; });
+      if (last < 0) return;
+      el(svg, 'circle', { cx: x(last), cy: y(se.vals[last]), r: 3.5, fill: se.color,
+        stroke: 'var(--surface)', 'stroke-width': 1.5 });
+      const t = el(svg, 'text', { x: x(last) + 7, y: y(se.vals[last]) + 3.5 + (se.dy || 0),
+        'font-size': 11, 'font-weight': 700, fill: 'var(--text)' });
+      t.textContent = se.label(se.vals[last]);
+    });
+
+    const cross = el(svg, 'line', { y1: M.t, y2: M.t + ih, stroke: 'var(--muted)', 'stroke-width': 1, visibility: 'hidden' });
+    const dots = cfg.series.map(se => el(svg, 'circle', { r: 3.5, fill: se.color,
+      stroke: 'var(--surface)', 'stroke-width': 1.5, visibility: 'hidden' }));
+    const tip = document.createElement('div');
+    tip.className = 'trend-tip';
+    const tm = document.createElement('div'); tm.className = 'tm'; tip.appendChild(tm);
+    const rows = cfg.series.map(se => {
+      const r = document.createElement('div'); r.className = 'tr';
+      const k = document.createElement('span'); k.className = 'tk'; k.style.borderColor = se.color;
+      const v = document.createElement('span'); v.className = 'tv';
+      const l = document.createElement('span'); l.className = 'tl'; l.textContent = se.name;
+      r.append(k, v, l); tip.appendChild(r);
+      return v;
+    });
+    box.appendChild(tip);
+    let cur = -1;
+    const show = i => {
+      cur = i;
+      cross.setAttribute('x1', x(i)); cross.setAttribute('x2', x(i)); cross.setAttribute('visibility', 'visible');
+      tm.textContent = monthLabel(months[i]);
+      cfg.series.forEach((se, k) => {
+        const v = se.vals[i];
+        if (v != null) {
+          dots[k].setAttribute('cx', x(i)); dots[k].setAttribute('cy', y(v)); dots[k].setAttribute('visibility', 'visible');
+          rows[k].textContent = cfg.fmt(v);
+        } else { dots[k].setAttribute('visibility', 'hidden'); rows[k].textContent = '—'; }
+      });
+      tip.style.display = 'block';
+      const rect = box.getBoundingClientRect();
+      const px = x(i) / W * rect.width;
+      tip.style.left = (px > rect.width * 0.6 ? px - tip.offsetWidth - 12 : px + 12) + 'px';
+      tip.style.top = '8px';
+    };
+    const hide = () => { cur = -1; cross.setAttribute('visibility', 'hidden'); dots.forEach(d => d.setAttribute('visibility', 'hidden')); tip.style.display = 'none'; };
+    box.addEventListener('pointermove', ev => {
+      const rect = box.getBoundingClientRect();
+      const fx = (ev.clientX - rect.left) / rect.width * W;
+      show(Math.max(0, Math.min(n - 1, Math.round((fx - M.l) / iw * (n - 1)))));
+    });
+    box.addEventListener('pointerleave', hide);
+    box.addEventListener('keydown', ev => {
+      if (ev.key === 'ArrowRight') { show(Math.min(n - 1, cur < 0 ? n - 1 : cur + 1)); ev.preventDefault(); }
+      else if (ev.key === 'ArrowLeft') { show(Math.max(0, cur < 0 ? n - 1 : cur - 1)); ev.preventDefault(); }
+      else if (ev.key === 'Escape') hide();
+    });
+    box.addEventListener('blur', hide);
+  }
+
+  const fmtSteps = v => Math.round(v).toLocaleString();
+  const fmtSleep = v => { const h = Math.floor(v), m = Math.round((v - h) * 60); return h + 'h ' + String(m).padStart(2, '0') + 'm'; };
+  const niceMax = (v, step) => Math.ceil(v / step) * step;
+
+  lineChart('t-steps', {
+    yMin: 0, yMax: 20000, ticks: [0, 5000, 10000, 15000, 20000],
+    tickFmt: v => v === 0 ? '0' : (v / 1000) + 'k', fmt: fmtSteps,
+    series: [
+      { vals: T.steps, color: '#4b5066', width: 1.5, faint: true, name: 'monthly' },
+      { vals: T.steps_roll, color: '#00b4d8', width: 2.5, name: v => fmtSteps(v), label: v => fmtSteps(v) },
+    ],
+  });
+
+  {
+    const peak = Math.max(1, ...T.run_roll.filter(v => v != null), ...T.bike_roll.filter(v => v != null));
+    const yMax = niceMax(peak, 25);
+    const ticks = []; const step = yMax > 100 ? 25 : 10;
+    for (let t = 0; t <= yMax; t += step) ticks.push(t);
+    lineChart('t-miles', {
+      yMin: 0, yMax, ticks, tickFmt: v => String(v), fmt: v => Math.round(v) + ' mi/wk',
+      series: [
+        { vals: T.run_roll, color: '#f4a261', width: 2.5, name: 'run', label: v => Math.round(v) + ' run' },
+        { vals: T.bike_roll, color: '#2ec4b6', width: 2.5, name: 'bike', label: v => Math.round(v) + ' bike', dy: 12 },
+      ],
+    });
+  }
+
+  lineChart('t-sleep', {
+    yMin: 5, yMax: 10, ticks: [5, 6, 7, 8, 9, 10], tickFmt: v => v + 'h', fmt: fmtSleep,
+    series: [
+      { vals: T.sleep, color: '#4b5066', width: 1.5, faint: true, name: 'monthly' },
+      { vals: T.sleep_roll, color: '#b892ff', width: 2.5, name: v => fmtSleep(v), label: v => fmtSleep(v) },
+    ],
+  });
+
+  {
+    const hv = [...T.hrv, ...T.hrv_roll].filter(v => v != null);
+    if (hv.length) {
+      const yMax = niceMax(Math.max(...hv), 10), yMin = Math.max(0, Math.floor(Math.min(...hv) / 10) * 10 - 10);
+      const ticks = []; for (let t = yMin; t <= yMax; t += 10) ticks.push(t);
+      lineChart('t-hrv', {
+        yMin, yMax, ticks, tickFmt: v => String(v), fmt: v => Math.round(v) + ' ms',
+        series: [
+          { vals: T.hrv, color: '#4b5066', width: 1.5, faint: true, name: 'monthly' },
+          { vals: T.hrv_roll, color: '#ffd166', width: 2.5, name: v => Math.round(v) + ' ms', label: v => Math.round(v) + ' ms' },
+        ],
+      });
+    }
+  }
+
+  lineChart('t-sri', {
+    yMin: 40, yMax: 100, ticks: [40, 55, 70, 85, 100], tickFmt: v => String(v), fmt: v => v.toFixed(0),
+    series: [
+      { vals: T.sri, color: '#4b5066', width: 1.5, faint: true, name: 'SRI monthly' },
+      { vals: T.cons_roll, color: '#e76f9e', width: 2.5, name: v => v.toFixed(0), label: v => v.toFixed(0), dy: 12 },
+      { vals: T.sri_roll, color: '#43aa8b', width: 2.5, name: v => v.toFixed(0), label: v => v.toFixed(0) },
+    ],
+  });
+
+  // ── phase plot (sleep duration × 4-day consistency, animated) ──
+  (function () {
+    const pts = T.phase;
+    const box = document.getElementById('t-phase');
+    if (!box || pts.length < 2) return;
+    const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+    const xMin = Math.floor((Math.min(...xs) - 0.05) * 2) / 2, xMax = Math.ceil((Math.max(...xs) + 0.05) * 2) / 2;
+    const yMin = Math.floor((Math.min(...ys) - 0.5) / 2.5) * 2.5, yMax = Math.ceil((Math.max(...ys) + 0.5) / 2.5) * 2.5;
+    const PW = 900, PH = 420, PM = { t: 14, r: 20, b: 40, l: 44 };
+    const piw = PW - PM.l - PM.r, pih = PH - PM.t - PM.b;
+    const px = v => PM.l + (v - xMin) / (xMax - xMin) * piw;
+    const py = v => PM.t + pih - (v - yMin) / (yMax - yMin) * pih;
+    const svg = el(box, 'svg', { viewBox: `0 0 ${PW} ${PH}` });
+    const fmtSleepP = v => { const h = Math.floor(v), m = Math.round((v - h) * 60); return h + 'h ' + String(m).padStart(2, '0') + 'm'; };
+
+    for (let v = yMin; v <= yMax + 0.01; v += 2.5) {
+      el(svg, 'line', { x1: PM.l, x2: PM.l + piw, y1: py(v), y2: py(v), stroke: 'var(--border)', 'stroke-width': 1 });
+      const t = el(svg, 'text', { x: PM.l - 7, y: py(v) + 4, 'text-anchor': 'end', 'font-size': 10, fill: 'var(--muted)' });
+      t.textContent = v % 5 === 0 ? String(v) : '';
+    }
+    for (let v = xMin; v <= xMax + 0.01; v += 0.5) {
+      el(svg, 'line', { x1: px(v), x2: px(v), y1: PM.t, y2: PM.t + pih, stroke: 'var(--border)', 'stroke-width': 1 });
+      const t = el(svg, 'text', { x: px(v), y: PM.t + pih + 16, 'text-anchor': 'middle', 'font-size': 10, fill: 'var(--muted)' });
+      t.textContent = fmtSleepP(v);
+    }
+    const xt = el(svg, 'text', { x: PM.l + piw / 2, y: PH - 4, 'text-anchor': 'middle', 'font-size': 11, fill: 'var(--muted)' });
+    xt.textContent = 'average sleep per night →';
+    const yt = el(svg, 'text', { x: 12, y: PM.t + pih / 2, 'font-size': 11, fill: 'var(--muted)', 'text-anchor': 'middle', transform: `rotate(-90 12 ${PM.t + pih / 2})` });
+    yt.textContent = '4-day consistency →';
+
+    const hex = h => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+    const cA = hex('#35507a'), cB = hex('#00e0ff');
+    const lerp = t => 'rgb(' + cA.map((a, k) => Math.round(a + (cB[k] - a) * t)).join(',') + ')';
+    const nP = pts.length;
+    const segs = [];
+    for (let i = 1; i < nP; i++) {
+      segs.push(el(svg, 'line', { x1: px(pts[i - 1].x), y1: py(pts[i - 1].y), x2: px(pts[i].x), y2: py(pts[i].y),
+        stroke: lerp(i / (nP - 1)), 'stroke-width': 2, 'stroke-linecap': 'round', opacity: 0 }));
+    }
+    const yearMarks = [];
+    pts.forEach((p, i) => {
+      if (p.m.endsWith('-01')) {
+        const g = el(svg, 'g', { opacity: 0 });
+        el(g, 'circle', { cx: px(p.x), cy: py(p.y), r: 3, fill: lerp(i / (nP - 1)), stroke: 'var(--surface)', 'stroke-width': 1.5 });
+        const t = el(g, 'text', { x: px(p.x) + 6, y: py(p.y) - 6, 'font-size': 10, fill: 'var(--muted)' });
+        t.textContent = p.m.slice(0, 4);
+        yearMarks.push({ i, g });
+      }
+    });
+    const head = el(svg, 'circle', { r: 5.5, fill: '#00e0ff', stroke: 'var(--surface)', 'stroke-width': 2 });
+
+    const tip = document.createElement('div'); tip.className = 'trend-tip';
+    const tm = document.createElement('div'); tm.className = 'tm';
+    const tv = document.createElement('div'); tv.className = 'tv';
+    tip.append(tm, tv); box.appendChild(tip);
+    box.addEventListener('pointermove', ev => {
+      const rect = box.getBoundingClientRect();
+      const mx = (ev.clientX - rect.left) / rect.width * PW, my = (ev.clientY - rect.top) / rect.height * PH;
+      let best = -1, bd = 1e9;
+      pts.forEach((p, i) => { const dd = (px(p.x) - mx) ** 2 + (py(p.y) - my) ** 2; if (dd < bd) { bd = dd; best = i; } });
+      if (best >= 0 && bd < 900) {
+        const p = pts[best];
+        tm.textContent = monthLabel(p.m);
+        tv.textContent = fmtSleepP(p.x) + ' · consistency ' + p.y.toFixed(0);
+        tip.style.display = 'block';
+        const cx = px(p.x) / PW * rect.width;
+        tip.style.left = (cx > rect.width * 0.6 ? cx - tip.offsetWidth - 12 : cx + 12) + 'px';
+        tip.style.top = (py(p.y) / PH * rect.height - 42) + 'px';
+      } else tip.style.display = 'none';
+    });
+    box.addEventListener('pointerleave', () => { tip.style.display = 'none'; });
+
+    const playBtn = document.getElementById('phase-play');
+    const scrub = document.getElementById('phase-scrub');
+    const when = document.getElementById('phase-when');
+    const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const DURATION = 12000;
+    let progress = 0, raf = null, lastTs = null;
+    const draw = () => {
+      const t = progress * (nP - 1);
+      segs.forEach((s, i) => s.setAttribute('opacity', i + 1 <= t ? 1 : 0));
+      yearMarks.forEach(m => m.g.setAttribute('opacity', m.i <= t ? 1 : 0));
+      const i0 = Math.min(Math.floor(t), nP - 2), f = t - i0;
+      head.setAttribute('cx', px(pts[i0].x + (pts[i0 + 1].x - pts[i0].x) * f));
+      head.setAttribute('cy', py(pts[i0].y + (pts[i0 + 1].y - pts[i0].y) * f));
+      when.textContent = monthLabel(pts[Math.round(t)].m);
+      scrub.value = progress;
+    };
+    const stop = () => { if (raf) cancelAnimationFrame(raf); raf = null; lastTs = null; playBtn.textContent = progress >= 1 ? '↻ Replay' : '▶ Play'; };
+    const tick = ts => {
+      if (lastTs != null) { progress = Math.min(1, progress + (ts - lastTs) / DURATION); draw(); if (progress >= 1) { stop(); return; } }
+      lastTs = ts; raf = requestAnimationFrame(tick);
+    };
+    const play = () => { if (progress >= 1) progress = 0; playBtn.textContent = '❚❚ Pause'; raf = requestAnimationFrame(tick); };
+    playBtn.addEventListener('click', () => (raf ? stop() : play()));
+    scrub.addEventListener('input', () => { stop(); progress = +scrub.value; draw(); });
+    if (reduced) { progress = 1; draw(); playBtn.textContent = '↻ Replay'; }
+    else {
+      progress = 0; draw();
+      const io = new IntersectionObserver(es => { if (es.some(e => e.isIntersecting)) { io.disconnect(); play(); } }, { threshold: 0.4 });
+      io.observe(box);
+    }
+  })();
+})();
+"""
+
+
 def build(db_path: str, out_path: str) -> None:
     print(f"Loading data from {db_path} …")
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
     days = load_data(db_path)
+    trends = build_trends(con, days)
+    con.close()
 
     data_js = f"const ALL_DAYS = {json.dumps(days, separators=(',', ':'))};\n"
+    trends_js = f"const TRENDS = {json.dumps(trends, separators=(',', ':'))};\n"
 
-    html = HTML_TEMPLATE.format(data_js=data_js)
+    html = HTML_TEMPLATE.format(
+        data_js=data_js,
+        trends_js=trends_js,
+        trends_css=TRENDS_CSS,
+        trends_panel=TRENDS_PANEL,
+        trends_script=TRENDS_SCRIPT,
+    )
     Path(out_path).write_text(html, encoding="utf-8")
     size = Path(out_path).stat().st_size
-    print(f"Written {out_path} ({size/1024:.0f} KB, {len(days)} days)")
+    print(f"Written {out_path} ({size/1024:.0f} KB, {len(days)} days, "
+          f"{len(trends.get('months', []))} trend months)")
 
 
 def main() -> None:
