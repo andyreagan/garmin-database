@@ -1,8 +1,11 @@
 # garmin-database
 
 A single-script tool that pulls your full Garmin Connect history into a local
-SQLite database (`garmin.db`) checked into this repo.  Run it periodically to
-keep the database up to date.
+SQLite database (`garmin.db`) checked into this repo.  A daily Claude routine on
+Andy's Mac runs `update`, rebuilds `index.html`, and pushes (see
+`~/projects/maintain/update-health-data.sh`). The former GitHub Actions
+cron was removed: Garmin's token flow needs persistent local state and it
+failed 61 runs in a row before GitHub disabled it.
 
 ## Metrics stored (one row per calendar day)
 
