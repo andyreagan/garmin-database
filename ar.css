@@ -10,25 +10,25 @@
   color-scheme: light;
   --bar-h:      40px;
   --sidebar-w:  220px;
-  --radius:     10px;
+  --radius:     0px;
   --font:       'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
 
-  --bg:         #f4f5f7;
+  --bg:         #ffffff;
   --surface:    #ffffff;
-  --surface-2:  #f4f5f7;          /* table heads, hover rows, inset wells */
-  --border:     #e5e7eb;
-  --text:       #111827;
-  --muted:      #6b7280;
-  --grid:       #e8eaee;          /* chart gridlines */
-  --axis:       #8b93a1;          /* chart tick labels */
-  --shadow:     0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.04);
+  --surface-2:  #f6f6f6;          /* table heads, hover rows, inset wells */
+  --border:     #d4d4d4;
+  --text:       #111111;
+  --muted:      #666666;
+  --grid:       #ececec;          /* chart gridlines */
+  --axis:       #777777;          /* chart tick labels */
+  --shadow:     none;
 
-  /* sidebar + universe bar stay dark in both themes */
-  --chrome-bg:     #111827;
-  --chrome-bg-2:   #1f2937;
-  --chrome-text:   #9ca3af;
-  --chrome-strong: #ffffff;
-  --chrome-dim:    #6b7280;
+  /* sidebar + universe bar (same surface as the page) */
+  --chrome-bg:     #ffffff;
+  --chrome-bg-2:   transparent;
+  --chrome-text:   #444444;
+  --chrome-strong: #000000;
+  --chrome-dim:    #888888;
 
   /* series colours (identity) */
   --blue:    #2a78d6;
@@ -48,8 +48,9 @@
   --good-bg: #d9f3dc;  --good-ink: #0b5a12;
   --warn-bg: #fdefc8;  --warn-ink: #7a4a00;
   --bad-bg:  #fbdcdc;  --bad-ink:  #8f1d1d;
-  --info-bg: #e6effc;  --info-ink: #1c4f95;  --info-border: #bcd4f5;
+  --info-bg: transparent;  --info-ink: #111111;  --info-border: #d4d4d4;
 
+  --link:       #0366d6;           /* same blue as andyreagan.com body links */
   --accent:     #2a78d6;           /* overridden per site below */
   --accent-ink: #ffffff;           /* text on an accent fill */
 }
@@ -58,10 +59,11 @@
 @media (prefers-color-scheme: dark) {
   :root:where(:not([data-theme="light"])) {
     color-scheme: dark;
-    --bg: #0d1017; --surface: #171b24; --surface-2: #1e232e; --border: #2a303d;
-    --text: #e8eaf0; --muted: #969dab; --grid: #262c38; --axis: #7f8796;
-    --shadow: 0 1px 3px rgba(0,0,0,.4);
-    --chrome-bg: #090b10; --chrome-bg-2: #171b24;
+    --bg: #0c0c0c; --surface: #0c0c0c; --surface-2: #181818; --border: #333333;
+    --text: #eeeeee; --muted: #999999; --grid: #222222; --axis: #888888;
+    --shadow: none;
+    --chrome-bg: #0c0c0c; --chrome-bg-2: transparent;
+    --chrome-text: #bbbbbb; --chrome-strong: #ffffff; --link: #6cb0ff;
     --blue: #4a94ea; --orange: #e2683a; --teal: #1fae7c; --yellow: #d39410;
     --pink: #e0649a; --green: #2ea52e; --purple: #9085e9; --red: #e66767;
     --gray: #7f8796;
@@ -69,15 +71,16 @@
     --good-bg: #123a1a; --good-ink: #8fe39a;
     --warn-bg: #3d2f0b; --warn-ink: #f5cf7a;
     --bad-bg:  #44181a; --bad-ink:  #f5a3a3;
-    --info-bg: #14263f; --info-ink: #a9c8f5; --info-border: #24406b;
+    --info-bg: transparent; --info-ink: #eeeeee; --info-border: #333333;
   }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #0d1017; --surface: #171b24; --surface-2: #1e232e; --border: #2a303d;
-  --text: #e8eaf0; --muted: #969dab; --grid: #262c38; --axis: #7f8796;
-  --shadow: 0 1px 3px rgba(0,0,0,.4);
-  --chrome-bg: #090b10; --chrome-bg-2: #171b24;
+  --bg: #0c0c0c; --surface: #0c0c0c; --surface-2: #181818; --border: #333333;
+  --text: #eeeeee; --muted: #999999; --grid: #222222; --axis: #888888;
+  --shadow: none;
+  --chrome-bg: #0c0c0c; --chrome-bg-2: transparent;
+    --chrome-text: #bbbbbb; --chrome-strong: #ffffff; --link: #6cb0ff;
   --blue: #4a94ea; --orange: #e2683a; --teal: #1fae7c; --yellow: #d39410;
   --pink: #e0649a; --green: #2ea52e; --purple: #9085e9; --red: #e66767;
   --gray: #7f8796;
@@ -85,7 +88,7 @@
   --good-bg: #123a1a; --good-ink: #8fe39a;
   --warn-bg: #3d2f0b; --warn-ink: #f5cf7a;
   --bad-bg:  #44181a; --bad-ink:  #f5a3a3;
-  --info-bg: #14263f; --info-ink: #a9c8f5; --info-border: #24406b;
+  --info-bg: transparent; --info-ink: #eeeeee; --info-border: #333333;
 }
 
 /* per-site accent */
@@ -104,7 +107,7 @@ body {
   font-size: 14px; line-height: 1.5; min-height: 100vh;
   padding-top: var(--bar-h);
 }
-a { color: var(--accent); }
+a { color: var(--link); }
 
 /* universe bar — injected by ar.js */
 .ar-bar {
@@ -330,3 +333,40 @@ svg.ar-chart { display: block; width: 100%; overflow: visible; }
 .legend { display: flex; gap: 6px 14px; flex-wrap: wrap; margin-bottom: 10px; }
 .legend-item { display: inline-flex; align-items: center; gap: 5px; font-size: 0.72rem; color: var(--muted); }
 .legend-item .sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex-shrink: 0; }
+
+/* ── PLAIN-TEXT LOOK ────────────────────────────────────────────────────────
+   Black on white, hairline rules, no cards or filled controls.  Colour is kept
+   for chart series, status, and links.  These override the component rules
+   above; the tokens at the top already carry the plain palette. */
+.ar-bar { border-bottom: 1px solid var(--border); font-size: .85rem; }
+.ar-bar a { padding: 4px 7px; border-radius: 0; }
+.ar-bar a:hover { text-decoration: underline; }
+.ar-bar a.current { background: none; box-shadow: none; text-decoration: underline; text-underline-offset: 4px; }
+.ar-bar a.ar-label { color: var(--chrome-dim); padding-right: 2px; }
+.ar-bar a.ar-label.current { color: var(--chrome-strong); }
+.ar-theme { border: 0; text-decoration: underline; }
+.sidebar { border-right: 1px solid var(--border); }
+.sidebar-logo, .sidebar-logo span { color: var(--text); font-weight: 700; font-size: 1.05rem; }
+.nav-item .icon { display: none; }
+.nav-item { padding: 5px 18px; }
+.nav-item:hover { color: var(--text); text-decoration: underline; }
+.nav-item.active { background: none; text-decoration: underline; text-underline-offset: 4px; }
+.kpi-strip { gap: 0 28px; border-bottom: 1px solid var(--border); padding-bottom: 14px;
+             grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
+.kpi-card { border-top: 0; padding: 8px 0; }
+.kpi-card .kpi-value, .metric-card-val { font-weight: 600; color: var(--text) !important; }
+.metric-grid { gap: 8px 40px; }
+.metric-card { padding: 4px 0 18px; }
+.range-btn, .btn, .roll-btn { border: 0; background: none; padding: 2px 5px; font-weight: 400;
+                              font-size: .78rem; border-radius: 0; }
+.range-btn:hover, .btn:hover, .roll-btn:hover { color: var(--text); text-decoration: underline; }
+.range-btn.active, .btn.active, .roll-btn.active { background: none; color: var(--text); font-weight: 700;
+                              text-decoration: underline; text-underline-offset: 4px; }
+.note { border: 0; border-left: 2px solid var(--text); padding: 2px 12px; }
+thead th { background: none; color: var(--text); border-bottom: 1px solid var(--text); }
+.badge, .badge.good, .badge.warn, .badge.bad { background: none; box-shadow: none; padding: 0; font-weight: 400; }
+.badge.good { color: var(--good); } .badge.warn { color: var(--warn); } .badge.bad { color: var(--bad); }
+.pagination button { border: 0; background: none; text-decoration: underline; }
+.pagination button.active { font-weight: 700; color: var(--text); }
+.ar-footer a { color: var(--link); }
+@media (max-width: 800px) { .sidebar { border-right: 0; border-bottom: 1px solid var(--border); } }

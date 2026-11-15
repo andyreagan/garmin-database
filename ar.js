@@ -56,16 +56,13 @@
   mq.addEventListener('change', () => apply(stored()));
 
   // ── UNIVERSE BAR + FOOTER ────────────────────────────────────────────────
+  const FITNESS = 'https://andyreagan.com/fitness.html';   // landing page listing the sites below
   const SITES = [
     ['garmin',   'Garmin',   'https://garmin.andyreagan.com/'],
     ['whoop',    'WHOOP',    'https://whoop.andyreagan.com/'],
     ['strava',   'Strava',   'https://strava.andyreagan.com/'],
     ['health',   'Bloodwork','https://health.andyreagan.com/'],
     ['training', 'Training', 'https://training.andyreagan.com/'],
-    null,
-    ['tools',    'Tools',          'https://tools.andyreagan.com/'],
-    ['viz',      'Visualizations', 'https://andyreagan.com/visualizations.html'],
-    ['blog',     'Blog',           'https://andyreagan.com/blog.html'],
   ];
   const meta = n => (document.querySelector(`meta[name="${n}"]`) || {}).content || '';
 
@@ -75,8 +72,8 @@
     const bar = document.createElement('header');
     bar.className = 'ar-bar';
     bar.innerHTML =
-      '<a class="ar-home" href="https://andyreagan.com/">andyreagan.com</a>' +
-      '<nav class="ar-links">' +
+      '<a class="ar-home" href="https://andyreagan.com/">← andyreagan.com</a>' +
+      '<nav class="ar-links"><a class="ar-label" href="' + FITNESS + '">Fitness:</a>' +
       SITES.map(s => s
         ? `<a href="${s[2]}"${s[0] === site ? ' class="current" aria-current="page"' : ''}>${s[1]}</a>`
         : '<span class="ar-sep"></span>').join('') +
